@@ -1,3 +1,62 @@
-xm‘AÓ@EYûçvÈx4 !E,`•%R¸@»]‰[Ø®¦«š$Ä!8!'¡œ1¶¿«şûõ»¹ÃãÃû7u‚hAëMu¿ZUXá‹9rî1xâ|À@c¢,øıó¾QRtg¥»ÀSò»‘pŒ:@B—ù(”áSj«¯¦…1Ò¬XÆ‹’`·ıt÷îñÉ‰o‘n´^0ò‘rğj \Èç¤ÜJét¤f½8
-_@ùaœ©ˆ¢¿I~"ì9_bG6÷gøY[J‰=É’í¾
-<Ûö•Èô½ÄL®¾*u³©ª}™ƒF!ƒ·Ì[:9k«Ás›×’çÛ~2y¥­5æêëpİ´%õ&º<.›kÔE÷ì­uµº ^^Á²ŸûµãşZyúl? îá©i•oö¯œ&îËH-g»íùßküµÇË¦úº°„
+'use strict';
+/**
+ * Integration test for the Vercel HTTP wrapper (api/signin.js) driven through a
+ * real local http server. No KV is configured here, so it exercises the
+ * request plumbing (method guard, CORS, JSON parsing, graceful 503).
+ */
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const http = require('node:http');
+
+const handler = require('../api/signin.js');
+let server, base;
+
+before(async () => {
+  server = http.createServer((req, res) => handler(req, res));
+  await new Promise((r) => server.listen(0, r));
+  base = 'http://127.0.0.1:' + server.address().port;
+});
+
+after(() => server && server.close());
+
+test('OPTIONS preflight returns CORS headers', async () => {
+  const res = await fetch(base + '/api/signin', { method: 'OPTIONS' });
+  assert.equal(res.status, 204);
+  assert.equal(res.headers.get('access-control-allow-origin'), '*');
+});
+
+test('GET is rejected with 405', async () => {
+  const res = await fetch(base + '/api/signin', { method: 'GET' });
+  assert.equal(res.status, 405);
+  const j = await res.json();
+  assert.equal(j.error, 'POST only');
+});
+
+test('POST ping succeeds even without KV configured', async () => {
+  const res = await fetch(base + '/api/signin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'ping' }),
+  });
+  // ping is answered before the KV check
+  const j = await res.json();
+  assert.equal(j.ok, true);
+  assert.equal(res.headers.get('access-control-allow-origin'), '*');
+});
+
+test('POST login with no KV returns graceful 503', async () => {
+  const res = await fetch(base + '/api/signin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'login', username: 'a', password: 'b' }),
+  });
+  assert.equal(res.status, 503);
+  const j = await res.json();
+  assert.match(j.error, /not configured/);
+});
+
+test('malformed JSON body returns 400', async () => {
+  const res = await fetch(base + '/api/signin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: '{ not json',
+  });
+  assert.equal(res.status, 400);
+});

@@ -1,3 +1,178 @@
-xm‘AÓ@EYûçvÈx4 !E,`•%R¸@»]‰[Ø®¦«š$Ä!8!'¡œ1¶¿«şûõ»¹ÃãÃû7u‚hAëMu¿ZUXá‹9rî1xâ|À@c¢,øıó¾QRtg¥»ÀSò»‘pŒ:@B—ù(”áSj«¯¦…1Ò¬XÆ‹’`·ıt÷îñÉ‰o‘n´^0ò‘rğj \Èç¤ÜJét¤f½8
-_@ùaœ©ˆ¢¿I~"ì9_bG6÷gøY[J‰=É’í¾
-<Ûö•Èô½ÄL®¾*u³©ª}™ƒF!ƒ·Ì[:9k«Ás›×’çÛ~2y¥­5æêëpİ´%õ&º<.›kÔE÷ì­uµº ^^Á²ŸûµãşZyúl? îá©i•oö¯œ&îËH-g»íùßküµÇË¦úº°„
+'use strict';
+/**
+ * Unit tests for the sign-in serverless handler.
+ * Run with:  npm run test:api   (or  node --test tests/ )
+ * No external dependencies â€” uses Node's built-in test runner + an in-memory KV.
+ */
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+
+const { handleSignin, keyOf } = require('../api/_lib/handler');
+const { sha256Hex } = require('../api/_lib/crypto');
+const { createKV, readEnv } = require('../api/_lib/kv');
+
+const ENV = { SECRET: 'top-secret' };
+
+// A tiny in-memory KV that satisfies the adapter contract used by the handler.
+function memKV() {
+  const map = new Map();
+  return {
+    configured: true,
+    _map: map,
+    async getJson(k) { return map.has(k) ? JSON.parse(map.get(k)) : null; },
+    async put(k, v) { map.set(k, v); },
+    async del(k) { map.delete(k); },
+    async listKeys(prefix) { return [...map.keys()].filter((k) => k.startsWith(prefix)); },
+  };
+}
+
+async function register(kv, user, extra = {}) {
+  return handleSignin({ action: 'register', secret: ENV.SECRET, user, ...extra }, kv, ENV);
+}
+
+test('ping works and needs no KV secret', async () => {
+  const r = await handleSignin({ action: 'ping' }, memKV(), ENV);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.platform, 'vercel');
+});
+
+test('unconfigured KV returns 503 not-configured (app falls back locally)', async () => {
+  const kv = { configured: false };
+  const r = await handleSignin({ action: 'login', username: 'a', password: 'b' }, kv, ENV);
+  assert.equal(r.status, 503);
+  assert.equal(r.body.ok, false);
+  assert.match(r.body.error, /not configured/);
+});
+
+test('register requires the admin secret', async () => {
+  const kv = memKV();
+  const r = await handleSignin({ action: 'register', user: { username: 'x', password: 'pw' } }, kv, ENV);
+  assert.equal(r.status, 401);
+  assert.equal(r.body.error, 'unauthorized');
+});
+
+test('register then login succeeds; wrong password fails; unknown user fails', async () => {
+  const kv = memKV();
+  const reg = await register(kv, { username: 'judge@court.mv', password: 'ID123456', role: 'judge' });
+  assert.equal(reg.body.ok, true);
+
+  const good = await handleSignin({ action: 'login', username: 'judge@court.mv', password: 'ID123456' }, kv, ENV);
+  assert.equal(good.body.ok, true);
+  assert.equal(good.body.user.role, 'judge');
+  // password material must never be returned
+  assert.equal(good.body.user.hash, undefined);
+  assert.equal(good.body.user.salt, undefined);
+  // new users must change their password on first sign-in
+  assert.equal(good.body.user.mustChange, true);
+
+  const bad = await handleSignin({ action: 'login', username: 'judge@court.mv', password: 'wrong' }, kv, ENV);
+  assert.equal(bad.body.ok, false);
+  assert.equal(bad.body.error, 'password');
+
+  const unknown = await handleSignin({ action: 'login', username: 'nobody', password: 'x' }, kv, ENV);
+  assert.equal(unknown.body.error, 'unknown');
+});
+
+test('username lookup is case-insensitive and trimmed', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'Alice@Court.mv', password: 'secret12' });
+  const r = await handleSignin({ action: 'login', username: '  alice@court.MV ', password: 'secret12' }, kv, ENV);
+  assert.equal(r.body.ok, true);
+});
+
+test('duplicate register is rejected unless overwrite', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'dup', password: 'aaaaaaaa' });
+  const again = await register(kv, { username: 'dup', password: 'bbbbbbbb' });
+  assert.equal(again.body.error, 'exists');
+  const forced = await register(kv, { username: 'dup', password: 'bbbbbbbb' }, { overwrite: true });
+  assert.equal(forced.body.ok, true);
+  const login = await handleSignin({ action: 'login', username: 'dup', password: 'bbbbbbbb' }, kv, ENV);
+  assert.equal(login.body.ok, true);
+});
+
+test('setPassword: needs old password, enforces min length, clears mustChange', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'user1', password: 'oldpass12' });
+
+  const weak = await handleSignin({ action: 'setPassword', username: 'user1', oldPassword: 'oldpass12', newPassword: 'short' }, kv, ENV);
+  assert.equal(weak.body.error, 'weak');
+
+  const wrongOld = await handleSignin({ action: 'setPassword', username: 'user1', oldPassword: 'nope', newPassword: 'newpass123' }, kv, ENV);
+  assert.equal(wrongOld.body.error, 'password');
+
+  const ok = await handleSignin({ action: 'setPassword', username: 'user1', oldPassword: 'oldpass12', newPassword: 'newpass123' }, kv, ENV);
+  assert.equal(ok.body.ok, true);
+  assert.equal(ok.body.user.mustChange, false);
+
+  // old password no longer works, new one does
+  const oldLogin = await handleSignin({ action: 'login', username: 'user1', password: 'oldpass12' }, kv, ENV);
+  assert.equal(oldLogin.body.ok, false);
+  const newLogin = await handleSignin({ action: 'login', username: 'user1', password: 'newpass123' }, kv, ENV);
+  assert.equal(newLogin.body.ok, true);
+});
+
+test('resetPassword (admin) sets a new password and forces change', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'user2', password: 'first123' });
+  const reset = await handleSignin({ action: 'resetPassword', secret: ENV.SECRET, username: 'user2', newPassword: 'reset1234' }, kv, ENV);
+  assert.equal(reset.body.ok, true);
+  const login = await handleSignin({ action: 'login', username: 'user2', password: 'reset1234' }, kv, ENV);
+  assert.equal(login.body.ok, true);
+  assert.equal(login.body.user.mustChange, true);
+});
+
+test('list returns users without secrets; delete removes them', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'a@x.mv', password: 'aaaaaaaa', role: 'staff' });
+  await register(kv, { username: 'b@x.mv', password: 'bbbbbbbb', role: 'participant' });
+
+  const list = await handleSignin({ action: 'list', secret: ENV.SECRET }, kv, ENV);
+  assert.equal(list.body.ok, true);
+  assert.equal(list.body.users.length, 2);
+  for (const u of list.body.users) {
+    assert.equal(u.hash, undefined);
+    assert.equal(u.salt, undefined);
+  }
+
+  const del = await handleSignin({ action: 'delete', secret: ENV.SECRET, username: 'a@x.mv' }, kv, ENV);
+  assert.equal(del.body.ok, true);
+  const list2 = await handleSignin({ action: 'list', secret: ENV.SECRET }, kv, ENV);
+  assert.equal(list2.body.users.length, 1);
+});
+
+test('list/delete/reset all require the secret', async () => {
+  const kv = memKV();
+  for (const action of ['list', 'delete', 'resetPassword']) {
+    const r = await handleSignin({ action, username: 'x' }, kv, ENV);
+    assert.equal(r.status, 401);
+  }
+});
+
+test('stored hash matches the browser formula SHA-256(salt + password)', async () => {
+  const kv = memKV();
+  await register(kv, { username: 'hashcheck', password: 'verifyme1' });
+  const rec = JSON.parse(kv._map.get(keyOf('hashcheck')));
+  assert.equal(rec.hash, sha256Hex(rec.salt + 'verifyme1'));
+});
+
+test('bad / empty body is handled gracefully', async () => {
+  const kv = memKV();
+  const r1 = await handleSignin(null, kv, ENV);
+  assert.equal(r1.status, 400);
+  const r2 = await handleSignin({ action: 'nonsense', secret: ENV.SECRET }, kv, ENV);
+  assert.equal(r2.status, 400);
+  assert.equal(r2.body.error, 'unknown action');
+});
+
+test('readEnv accepts both Vercel KV and Upstash variable names', () => {
+  const a = readEnv({ KV_REST_API_URL: 'https://a/', KV_REST_API_TOKEN: 't1' });
+  assert.equal(a.url, 'https://a');
+  assert.equal(a.token, 't1');
+  const b = readEnv({ UPSTASH_REDIS_REST_URL: 'https://b', UPSTASH_REDIS_REST_TOKEN: 't2' });
+  assert.equal(b.url, 'https://b');
+  assert.equal(b.token, 't2');
+  const none = createKV({});
+  assert.equal(none.configured, false);
+});
